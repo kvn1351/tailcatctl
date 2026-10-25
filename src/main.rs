@@ -1017,6 +1017,10 @@ fn real_main() -> Result<i32, String> {
         "devices" => devices_command(&args),
         "add" => add_command(&args),
         "remove" => remove_command(&args),
+        "version" | "--version" | "-v" => {
+            println!("tailcatctl {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         "lease" => Ok(lease_command(&args)),
         "host-keys" => host_keys_command(&args),
         "ensure" => {
