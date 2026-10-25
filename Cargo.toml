@@ -1,0 +1,18 @@
+[package]
+name = "tailcatctl"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tailcatctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tailcatctl"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
