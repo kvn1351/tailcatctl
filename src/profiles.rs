@@ -1113,6 +1113,14 @@ pub fn sync_frontend(value: Value) -> Result<Value, String> {
         };
     }
 
+    if let Some(active) = registry.devices.iter().find(|d| d.id == registry.active_device_id) {
+        if registry.active_endpoint == "lan" && active.lan.is_none() && active.tailcat.is_some() {
+            registry.active_endpoint = "tailcat".to_owned();
+        } else if registry.active_endpoint == "tailcat" && active.tailcat.is_none() && active.lan.is_some() {
+            registry.active_endpoint = "lan".to_owned();
+        }
+    }
+
     commit(&path, &mut registry)?;
     Ok(frontend_from_registry(&registry))
 }
