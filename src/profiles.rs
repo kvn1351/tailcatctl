@@ -391,6 +391,10 @@ pub fn list() -> Result<Registry, String> {
 }
 
 pub fn find_device(query: &str) -> Result<Device, String> {
+    find_device_with_endpoint(query, None)
+}
+
+pub fn find_device_with_endpoint(query: &str, preferred_ep: Option<&str>) -> Result<Device, String> {
     let path = registry_path()?;
     let _lock = lock_registry(&path, false)?;
     let registry = load_registry(&path)?;
@@ -400,7 +404,21 @@ pub fn find_device(query: &str) -> Result<Device, String> {
         return Ok(dev.clone());
     }
 
-    // 2. Exact Name match (case-insensitive)
+    // 2. Prefix match on ID (if query is at least 4 hex characters)
+    if query.len() >= 4 {
+        let id_matches: Vec<_> = registry
+            .devices
+            .iter()
+            .filter(|d| d.id.starts_with(query))
+            .collect();
+        if id_matches.len() == 1 {
+            return Ok((*id_matches[0]).clone());
+        } else if id_matches.len() > 1 {
+            return Err(format!("device ID prefix {:?} is ambiguous", query));
+        }
+    }
+
+    // 3. Exact Name match (case-insensitive)
     let query_lower = query.to_ascii_lowercase();
     let exact_matches: Vec<_> = registry
         .devices
@@ -411,10 +429,24 @@ pub fn find_device(query: &str) -> Result<Device, String> {
     if exact_matches.len() == 1 {
         return Ok(exact_matches[0].clone());
     } else if exact_matches.len() > 1 {
-        return Err(format!("device name {:?} is ambiguous", query));
+        // Disambiguate by endpoint if specified (e.g. "Kindle:tailcat" vs "Kindle:lan")
+        if let Some(ep) = preferred_ep {
+            let ep_matches: Vec<_> = exact_matches
+                .iter()
+                .filter(|d| match ep {
+                    "lan" => d.lan.is_some(),
+                    "tailcat" => d.tailcat.is_some(),
+                    _ => false,
+                })
+                .collect();
+            if ep_matches.len() == 1 {
+                return Ok((*ep_matches[0]).clone());
+            }
+        }
+        return Err(format!("device name {:?} is ambiguous (matches {} devices)", query, exact_matches.len()));
     }
 
-    // 3. Prefix match on Name (case-insensitive)
+    // 4. Prefix match on Name (case-insensitive)
     let prefix_matches: Vec<_> = registry
         .devices
         .iter()
@@ -424,6 +456,19 @@ pub fn find_device(query: &str) -> Result<Device, String> {
     if prefix_matches.len() == 1 {
         return Ok(prefix_matches[0].clone());
     } else if prefix_matches.len() > 1 {
+        if let Some(ep) = preferred_ep {
+            let ep_matches: Vec<_> = prefix_matches
+                .iter()
+                .filter(|d| match ep {
+                    "lan" => d.lan.is_some(),
+                    "tailcat" => d.tailcat.is_some(),
+                    _ => false,
+                })
+                .collect();
+            if ep_matches.len() == 1 {
+                return Ok((*ep_matches[0]).clone());
+            }
+        }
         return Err(format!("device prefix {:?} is ambiguous", query));
     }
 
@@ -449,40 +494,46 @@ pub fn resolve_target(
     let desired_endpoint = endpoint_spec.or(preferred_endpoint);
 
     // Try finding registered device
-    if let Ok(dev) = find_device(base_query) {
-        let ep = match desired_endpoint {
-            Some("lan") => {
-                dev.lan.clone().ok_or_else(|| {
-                    format!("device {:?} has no LAN endpoint configured", dev.name)
-                })?
-            }
-            Some("tailcat") => {
-                dev.tailcat.clone().ok_or_else(|| {
-                    format!("device {:?} has no Tailcat endpoint configured", dev.name)
-                })?
-            }
-            Some(other) => return Err(format!("unknown endpoint type {:?}", other)),
-            None => {
-                let path = registry_path()?;
-                let active_ep = load_registry(&path)
-                    .map(|r| r.active_endpoint)
-                    .unwrap_or_else(|_| "tailcat".to_string());
-                match active_ep.as_str() {
-                    "lan" if dev.lan.is_some() => dev.lan.clone().unwrap(),
-                    "tailcat" if dev.tailcat.is_some() => dev.tailcat.clone().unwrap(),
-                    _ => {
-                        if let Some(tc) = &dev.tailcat {
-                            tc.clone()
-                        } else if let Some(lan) = &dev.lan {
-                            lan.clone()
-                        } else {
-                            return Err(format!("device {:?} has no configured endpoints", dev.name));
+    match find_device_with_endpoint(base_query, desired_endpoint) {
+        Ok(dev) => {
+            let ep = match desired_endpoint {
+                Some("lan") => {
+                    dev.lan.clone().ok_or_else(|| {
+                        format!("device {:?} has no LAN endpoint configured", dev.name)
+                    })?
+                }
+                Some("tailcat") => {
+                    dev.tailcat.clone().ok_or_else(|| {
+                        format!("device {:?} has no Tailcat endpoint configured", dev.name)
+                    })?
+                }
+                Some(other) => return Err(format!("unknown endpoint type {:?}", other)),
+                None => {
+                    let path = registry_path()?;
+                    let active_ep = load_registry(&path)
+                        .map(|r| r.active_endpoint)
+                        .unwrap_or_else(|_| "tailcat".to_string());
+                    match active_ep.as_str() {
+                        "lan" if dev.lan.is_some() => dev.lan.clone().unwrap(),
+                        "tailcat" if dev.tailcat.is_some() => dev.tailcat.clone().unwrap(),
+                        _ => {
+                            if let Some(tc) = &dev.tailcat {
+                                tc.clone()
+                            } else if let Some(lan) = &dev.lan {
+                                lan.clone()
+                            } else {
+                                return Err(format!("device {:?} has no configured endpoints", dev.name));
+                            }
                         }
                     }
                 }
-            }
-        };
-        return Ok((Some(dev), ep));
+            };
+            return Ok((Some(dev), ep));
+        }
+        Err(err) if err.contains("ambiguous") => {
+            return Err(err);
+        }
+        Err(_) => {}
     }
 
     // Check if target matches an endpoint host of any registered device
@@ -1304,5 +1355,42 @@ mod registry_tests {
         let (dev3, ep3) = resolve_target("tc987654321098765432", None).unwrap();
         assert_eq!(dev3.unwrap().id, "kindle-pw5");
         assert_eq!(ep3.host, "tc987654321098765432");
+    }
+
+    #[test]
+    fn resolve_target_disambiguates_two_devices_with_same_name_by_endpoint() {
+        let _home = TestHome::new();
+        // Device 1: named "Kindle", only tailcat endpoint
+        upsert_endpoint(
+            config("tcp1111111111", ""),
+            Some("dev-one-uuid"),
+            Some("Kindle"),
+            Some("tailcat"),
+            None,
+        )
+        .unwrap();
+
+        // Device 2: named "Kindle", only lan endpoint
+        upsert_endpoint(
+            config("192.168.1.50", ""),
+            Some("dev-two-uuid"),
+            Some("Kindle"),
+            Some("lan"),
+            None,
+        )
+        .unwrap();
+
+        // Target: "Kindle:tailcat" -> should disambiguate to dev-one-uuid
+        let (dev1, ep1) = resolve_target("Kindle:tailcat", None).unwrap();
+        assert_eq!(dev1.unwrap().id, "dev-one-uuid");
+        assert_eq!(ep1.host, "tcp1111111111");
+
+        // Target: "Kindle:lan" -> should disambiguate to dev-two-uuid
+        let (dev2, ep2) = resolve_target("Kindle:lan", None).unwrap();
+        assert_eq!(dev2.unwrap().id, "dev-two-uuid");
+        assert_eq!(ep2.host, "192.168.1.50");
+
+        // Target: "Kindle" without endpoint specifier -> should return ambiguous error
+        assert!(resolve_target("Kindle", None).is_err());
     }
 }
