@@ -622,8 +622,8 @@ fn switch_command(args: &[String]) -> Result<i32, String> {
             println!("{}", serde_json::to_string_pretty(&reg.devices).unwrap());
             return Ok(0);
         }
-        println!("{:<16} {:<24} {:<8} ENDPOINTS", "NAME", "ID", "ACTIVE");
-        println!("{:<16} {:<24} {:<8} ---------", "----", "--", "------");
+        println!("{:<12} {:<34} {:<8} ENDPOINTS", "NAME", "ID", "ACTIVE");
+        println!("{:<12} {:<34} {:<8} ---------", "----", "----", "------");
         for dev in &reg.devices {
             let active = if dev.id == reg.active_device_id {
                 "*"
@@ -638,7 +638,7 @@ fn switch_command(args: &[String]) -> Result<i32, String> {
                 endpoints.push("lan");
             }
             println!(
-                "{:<16} {:<24} {:<8} {}",
+                "{:<12} {:<34} {:<8} {}",
                 dev.name,
                 dev.id,
                 active,
@@ -703,15 +703,15 @@ fn devices_command(args: &[String]) -> Result<i32, String> {
         println!("{}", serde_json::to_string_pretty(&reg).unwrap());
         return Ok(0);
     }
-    println!("{:<16} {:<24} {:<10} {:<32}", "NAME", "ID", "TYPE", "HOST");
-    println!("{:<16} {:<24} {:<10} {:<32}", "----", "--", "----", "----");
+    println!("{:<12} {:<34} {:<8} {}", "NAME", "ID", "TYPE", "HOST");
+    println!("{:<12} {:<34} {:<8} {}", "----", "----", "----", "----");
     for dev in &reg.devices {
         if let Some(tc) = &dev.tailcat {
-            println!("{:<16} {:<24} {:<10} {:<32}", dev.name, dev.id, "tailcat", shorten_middle(&tc.host, 32));
+            println!("{:<12} {:<34} {:<8} {}", dev.name, dev.id, "tailcat", shorten_middle(&tc.host, 34));
         }
         if let Some(lan) = &dev.lan {
             let host_str = format!("{}:{}", lan.host, lan.port);
-            println!("{:<16} {:<24} {:<10} {:<32}", dev.name, dev.id, "lan", shorten_middle(&host_str, 32));
+            println!("{:<12} {:<34} {:<8} {}", dev.name, dev.id, "lan", shorten_middle(&host_str, 34));
         }
     }
     Ok(0)
