@@ -14,9 +14,15 @@ use tailcatctl::{ensure_daemon, ping_endpoint, profiles, request, run_daemon, Co
 use tempfile::NamedTempFile;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+static CHILD_RUNNING: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn handle_signal(_: libc::c_int) {
+extern "C" fn handle_signal(sig: libc::c_int) {
     TERMINATE.store(true, Ordering::SeqCst);
+    if !CHILD_RUNNING.load(Ordering::SeqCst) {
+        unsafe {
+            libc::_exit(128 + sig);
+        }
+    }
 }
 
 fn install_signal_handlers() {
@@ -104,7 +110,7 @@ fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-fn prompt_password() -> Result<String, String> {
+fn prompt_password(prompt: &str) -> Result<String, String> {
     let mut tty = OpenOptions::new()
         .read(true)
         .write(true)
@@ -121,13 +127,13 @@ fn prompt_password() -> Result<String, String> {
     let mut hidden = original;
     hidden.c_lflag &= !libc::ECHO;
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) };
-    let _ = tty.write_all(b"SSH password: ");
+    let _ = tty.write_all(prompt.as_bytes());
     let mut bytes = Vec::new();
     let read_result = loop {
         let mut byte = [0_u8; 1];
         match tty.read(&mut byte) {
             Ok(0) => break Ok(()),
-            Ok(_) if byte[0] == b'\n' => break Ok(()),
+            Ok(_) if byte[0] == b'\n' || byte[0] == b'\r' => break Ok(()),
             Ok(_) => bytes.push(byte[0]),
             Err(error) => break Err(error),
         }
@@ -136,7 +142,7 @@ fn prompt_password() -> Result<String, String> {
     let _ = tty.write_all(b"\n");
     read_result
         .map_err(|e| format!("read password: {}", e))
-        .map(|_| String::from_utf8_lossy(&bytes).into_owned())
+        .map(|_| String::from_utf8_lossy(&bytes).trim_end_matches(&['\r', '\n'][..]).to_owned())
 }
 
 fn acquire(config: &Config) -> Result<(UnixStream, String), String> {
@@ -164,9 +170,11 @@ fn acquire_prompted(config: &mut Config) -> Result<(UnixStream, String), String>
                     lower.contains("auth")
                         || lower.contains("password")
                         || lower.contains("permission denied")
+                        || lower.contains("askpass")
                 } =>
         {
-            config.password = prompt_password()?;
+            let prompt = format!("Password for {}@{}: ", config.username, config.host);
+            config.password = prompt_password(&prompt)?;
             acquire(config)
         }
         Err(error) => Err(error),
@@ -240,7 +248,10 @@ fn run_child(mut command: Command, grouped: bool) -> Result<i32, String> {
     let child = command
         .spawn()
         .map_err(|e| format!("cannot start child command: {}", e))?;
-    Ok(child_exit(wait_child(child, grouped)?))
+    CHILD_RUNNING.store(true, Ordering::SeqCst);
+    let result = wait_child(child, grouped);
+    CHILD_RUNNING.store(false, Ordering::SeqCst);
+    Ok(child_exit(result?))
 }
 
 fn current_user() -> String {
@@ -251,7 +262,7 @@ fn current_user() -> String {
 
 /// Dispatches an SSH session or command to a target.
 /// Syntax: `tailcatctl ssh [flags] [user@]<host> [remote_command...]`
-fn run_ssh_subcommand(args: &[String]) -> Result<i32, String> {
+fn run_ssh_subcommand(args: &[String], quote_remote: bool) -> Result<i32, String> {
     let mut config_file: Option<String> = None;
     let mut device_opt: Option<String> = None;
     let mut endpoint_opt: Option<String> = None;
@@ -335,7 +346,16 @@ fn run_ssh_subcommand(args: &[String]) -> Result<i32, String> {
         (cfg, remote_cmd)
     };
 
-    execute_ssh(config, remote_command, force_pty)
+    if quote_remote && !remote_command.is_empty() {
+        let quoted = remote_command
+            .iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        execute_ssh(config, vec![quoted], force_pty.or(Some(false)))
+    } else {
+        execute_ssh(config, remote_command, force_pty)
+    }
 }
 
 fn execute_ssh(
@@ -587,7 +607,7 @@ fn ping_command(args: &[String]) -> Result<i32, String> {
 
 fn switch_command(args: &[String]) -> Result<i32, String> {
     if args.is_empty() {
-        return Err("usage: tailcatctl switch <device> | switch --list [--json]".into());
+        return Err("usage: tailcatctl switch <device> [--endpoint lan|tailcat] | switch --list [--json]".into());
     }
     if args[0] == "--list" || args[0] == "-l" {
         let json_mode = args.len() > 1 && args[1] == "--json";
@@ -622,8 +642,26 @@ fn switch_command(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
 
-    let dev = profiles::select(&args[0])?;
-    println!("Switched to device \"{}\" ({})", dev.name, dev.id);
+    let mut device_name = None;
+    let mut endpoint_opt = None;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].clone();
+        match flag.as_str() {
+            "--endpoint" | "-e" => {
+                endpoint_opt = Some(option_value(args, &mut i, if flag == "-e" { "-e" } else { "--endpoint" })?);
+            }
+            other if !other.starts_with('-') && device_name.is_none() => {
+                device_name = Some(other.to_owned());
+            }
+            other => return Err(format!("unexpected argument: {}", other)),
+        }
+        i += 1;
+    }
+
+    let target = device_name.ok_or_else(|| "usage: tailcatctl switch <device> [--endpoint lan|tailcat]".to_string())?;
+    let (dev, ep) = profiles::select(&target, endpoint_opt.as_deref())?;
+    println!("Switched to device \"{}\" ({}) [endpoint: {}]", dev.name, dev.id, ep);
     Ok(0)
 }
 
@@ -998,6 +1036,7 @@ fn sync_command(args: &[String]) -> Result<i32, String> {
 }
 
 fn real_main() -> Result<i32, String> {
+    install_signal_handlers();
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         usage();
@@ -1005,8 +1044,8 @@ fn real_main() -> Result<i32, String> {
     }
     let command = args.remove(0);
     match command.as_str() {
-        "ssh" => run_ssh_subcommand(&args),
-        "cmd" => run_ssh_subcommand(&args),
+        "ssh" => run_ssh_subcommand(&args, false),
+        "cmd" => run_ssh_subcommand(&args, true),
         "sftp" => run_sftp_subcommand(&args),
         "status" => status_command(&args),
         "ping" => ping_command(&args),
@@ -1014,7 +1053,7 @@ fn real_main() -> Result<i32, String> {
         "use" => switch_command(&args),
         "up" => up_command(&args),
         "down" => down_command(&args),
-        "devices" => devices_command(&args),
+        "devices" | "list" | "ls" => devices_command(&args),
         "add" => add_command(&args),
         "remove" => remove_command(&args),
         "version" | "--version" | "-v" => {
@@ -1034,13 +1073,25 @@ fn real_main() -> Result<i32, String> {
         "frontend" => frontend_command(),
         "sync" => sync_command(&args),
         other => {
-            // If argument is a user@device or device name, treat as 'tailcatctl ssh <arg>'
-            if other.contains('@') || !other.starts_with('-') {
+            let is_user_device = other.contains('@');
+            let is_tc = tailcatctl::is_tailcat_host(other);
+            let is_known_dev = profiles::list()
+                .map(|reg| {
+                    reg.devices
+                        .iter()
+                        .any(|d| d.id == other || d.name.eq_ignore_ascii_case(other))
+                })
+                .unwrap_or(false);
+
+            if is_user_device || is_tc || is_known_dev {
                 let mut ssh_args = vec![other.to_owned()];
                 ssh_args.extend(args);
-                run_ssh_subcommand(&ssh_args)
+                run_ssh_subcommand(&ssh_args, false)
             } else {
-                Err(format!("unknown command: {} (try --help)", other))
+                Err(format!(
+                    "unknown command or device {:?} (try --help or 'tailcatctl devices')",
+                    other
+                ))
             }
         }
     }

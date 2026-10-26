@@ -51,7 +51,7 @@ ssh_pid=$!
 watch_pid=$!
 wait "$ssh_pid"
 status=$?
-kill "$watch_pid" 2>/dev/null
+kill -9 "$watch_pid" 2>/dev/null
 wait "$watch_pid" 2>/dev/null
 exit "$status"
 "#;
@@ -63,7 +63,7 @@ exit "$status"
         "root".to_string()
     }
     fn default_known_hosts() -> String {
-        expand_path("~/.config/tailcat/ssh_known_hosts")
+        expand_path("~/.ssh/known_hosts")
     }
     fn default_ssh() -> String {
         "ssh".to_string()
@@ -462,6 +462,14 @@ exit "$status"
         let bytes = read_line_cap(&mut stream)?;
         let reply: Reply = serde_json::from_slice(&bytes)
             .map_err(|e| format!("invalid broker response: {}", e))?;
+        if reply.protocol != PROTOCOL {
+            return Err("broker protocol version mismatch".into());
+        }
+        if !reply.ok && op == "acquire" {
+            return Err(reply.error.unwrap_or_else(|| "broker request failed".into()));
+        }
+        stream.set_read_timeout(None).ok();
+        stream.set_write_timeout(None).ok();
         Ok((stream, reply))
     }
 
@@ -470,17 +478,6 @@ exit "$status"
         validate_socket_entry(&path)?;
         if UnixStream::connect(&path).is_ok() {
             return Ok(());
-        }
-        let lock = lock_file(&runtime_dir()?)?;
-        if !take_lock(&lock, true).map_err(|e| format!("take broker startup lock: {}", e))? {
-            return Err("timed out waiting for broker startup lock".into());
-        }
-        validate_socket_entry(&path)?;
-        if UnixStream::connect(&path).is_ok() {
-            return Ok(());
-        }
-        if path.exists() {
-            safe_socket_remove(&path)?;
         }
         let current_exe =
             env::current_exe().map_err(|e| format!("locate broker executable: {}", e))?;
@@ -688,9 +685,29 @@ exit "$status"
             .arg("-o")
             .arg("ControlPersist=no")
             .arg("-o")
-            .arg("StrictHostKeyChecking=yes")
+            .arg("StrictHostKeyChecking=yes");
+
+        let default_ssh_kh = expand_path("~/.ssh/known_hosts");
+        let default_tc_kh = expand_path("~/.config/tailcat/ssh_known_hosts");
+        let kh_arg = if cfg.0.known_hosts == default_ssh_kh {
+            if Path::new(&default_tc_kh).exists() {
+                format!("{} {}", cfg.0.known_hosts, default_tc_kh)
+            } else {
+                cfg.0.known_hosts.clone()
+            }
+        } else if cfg.0.known_hosts == default_tc_kh {
+            if Path::new(&default_ssh_kh).exists() {
+                format!("{} {}", default_ssh_kh, cfg.0.known_hosts)
+            } else {
+                cfg.0.known_hosts.clone()
+            }
+        } else {
+            cfg.0.known_hosts.clone()
+        };
+
+        command
             .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", cfg.0.known_hosts))
+            .arg(format!("UserKnownHostsFile={}", kh_arg))
             .arg("-o")
             .arg("GlobalKnownHostsFile=/dev/null")
             .arg("-F")
@@ -725,16 +742,25 @@ exit "$status"
             let script = tempdir.path().join("askpass");
             fs::write(
                 &script,
-                b"#!/bin/sh\nprintf '%s\\n' \"$TAILCATCTL_PASSWORD\"\n",
+                b"#!/bin/sh\ncase \"$1\" in\n  *[pP]assphrase*) exit 1 ;;\n  *) printf '%s\\n' \"$TAILCATCTL_PASSWORD\" ;;\nesac\n",
             )
             .map_err(|e| format!("create askpass helper: {}", e))?;
             fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
                 .map_err(|e| format!("secure askpass helper: {}", e))?;
             command
+                .arg("-o")
+                .arg("PasswordAuthentication=yes")
+                .arg("-o")
+                .arg("KbdInteractiveAuthentication=yes")
                 .env("SSH_ASKPASS", &script)
                 .env("SSH_ASKPASS_REQUIRE", "force")
                 .env("DISPLAY", "tailcatctl:0")
                 .env("TAILCATCTL_PASSWORD", &cfg.0.password);
+        } else {
+            command
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .env("SSH_ASKPASS_REQUIRE", "never");
         }
 
         let mut pipe_fds = [0 as libc::c_int; 2];
@@ -856,6 +882,7 @@ exit "$status"
     }
 
     fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<BrokerState>>) {
+        stream.set_nonblocking(false).ok();
         let mut holding_key: Option<String> = None;
         let result = (|| -> Result<(), String> {
             let raw = read_line_cap(&mut stream)?;
@@ -899,9 +926,7 @@ exit "$status"
                             control_path_str = endpoint.control_path.to_string_lossy().into_owned();
                             holding_key = Some(key.clone());
                         } else {
-                            drop(guard);
                             let endpoint = create_master(eff)?;
-                            let mut guard = shared.lock().unwrap();
                             control_path_str = endpoint.control_path.to_string_lossy().into_owned();
                             let mut ep = endpoint;
                             ep.leases = 1;
@@ -911,8 +936,14 @@ exit "$status"
                     }
 
                     send_json(&mut stream, &Reply::success(Some(control_path_str)))?;
-                    let mut dummy = [0u8; 1];
-                    let _ = stream.read(&mut dummy);
+                    stream.set_read_timeout(None).ok();
+                    let mut sink = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut sink) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
                     Ok(())
                 }
                 other => Err(format!("unknown operation {:?}", other)),
@@ -925,8 +956,17 @@ exit "$status"
 
         if let Some(key) = holding_key {
             let mut guard = shared.lock().unwrap();
-            if let Some(endpoint) = guard.endpoints.get_mut(&key) {
+            let should_kill = if let Some(endpoint) = guard.endpoints.get_mut(&key) {
                 endpoint.leases = endpoint.leases.saturating_sub(1);
+                endpoint.leases == 0
+            } else {
+                false
+            };
+            if should_kill {
+                if let Some(mut endpoint) = guard.endpoints.remove(&key) {
+                    kill_group(&mut endpoint.child);
+                    let _ = endpoint.child.wait();
+                }
             }
         }
 
@@ -1045,30 +1085,10 @@ exit "$status"
                 resolve_program(&config.tailcat_executable)
             };
 
-            // Probe via quick SSH check through proxy
-            let ssh_bin = resolve_program(&config.ssh_executable);
-            let proxy = format!(
-                "exec {} {} {}",
-                quote_shell(&tc_bin),
-                quote_shell(&config.host),
-                config.port
-            );
-
-            let mut cmd = Command::new(ssh_bin);
-            cmd.args(["-F", "/dev/null"])
-                .args(["-o", "StrictHostKeyChecking=no"])
-                .args(["-o", "UserKnownHostsFile=/dev/null"])
-                .args(["-o", "GlobalKnownHostsFile=/dev/null"])
-                .args(["-o", "BatchMode=yes"])
-                .args(["-o", "NumberOfPasswordPrompts=0"])
-                .arg("-o")
-                .arg(proxy)
-                .arg("-o")
-                .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)))
-                .arg("-p")
-                .arg(config.port.to_string())
-                .arg(format!("probe@{}", config.host))
-                .arg("true");
+            let mut cmd = Command::new(&tc_bin);
+            cmd.arg("ping")
+                .arg(format!("--timeout={}s", timeout.as_secs().max(1)))
+                .arg(&config.host);
 
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
@@ -1080,7 +1100,12 @@ exit "$status"
             let deadline = Instant::now() + timeout;
             loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => break,
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            return Err("tailcat ping returned error (target unreachable)".to_string());
+                        }
+                        break;
+                    }
                     Ok(None) if Instant::now() < deadline => {
                         thread::sleep(Duration::from_millis(20))
                     }

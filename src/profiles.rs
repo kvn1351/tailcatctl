@@ -48,9 +48,9 @@ pub struct Device {
     pub id: String,
     #[serde(alias = "alias")]
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub lan: Option<Config>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tailcat: Option<Config>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, Value>,
@@ -356,10 +356,12 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 
 pub fn normalized_alias(value: &str) -> String {
     let trimmed = value.trim();
-    if let Some(prefix) = trimmed.strip_suffix("(Tailcat)") {
-        let prefix = prefix.trim();
-        if !prefix.is_empty() {
-            return prefix.to_owned();
+    for suffix in ["(Tailcat)", "(Tailscale)"] {
+        if let Some(prefix) = trimmed.strip_suffix(suffix) {
+            let prefix = prefix.trim();
+            if !prefix.is_empty() {
+                return prefix.to_owned();
+            }
         }
     }
     trimmed.to_owned()
@@ -461,13 +463,22 @@ pub fn resolve_target(
             }
             Some(other) => return Err(format!("unknown endpoint type {:?}", other)),
             None => {
-                // If device has tailcat, prefer tailcat by default; otherwise lan
-                if let Some(tc) = &dev.tailcat {
-                    tc.clone()
-                } else if let Some(lan) = &dev.lan {
-                    lan.clone()
-                } else {
-                    return Err(format!("device {:?} has no configured endpoints", dev.name));
+                let path = registry_path()?;
+                let active_ep = load_registry(&path)
+                    .map(|r| r.active_endpoint)
+                    .unwrap_or_else(|_| "tailcat".to_string());
+                match active_ep.as_str() {
+                    "lan" if dev.lan.is_some() => dev.lan.clone().unwrap(),
+                    "tailcat" if dev.tailcat.is_some() => dev.tailcat.clone().unwrap(),
+                    _ => {
+                        if let Some(tc) = &dev.tailcat {
+                            tc.clone()
+                        } else if let Some(lan) = &dev.lan {
+                            lan.clone()
+                        } else {
+                            return Err(format!("device {:?} has no configured endpoints", dev.name));
+                        }
+                    }
                 }
             }
         };
@@ -540,27 +551,38 @@ pub fn resolve(device_id: Option<&str>, prefer_lan: bool) -> Result<(Device, Con
     Ok((device, config))
 }
 
-pub fn select(id_or_name: &str) -> Result<Device, String> {
+pub fn select(id_or_name: &str, endpoint_override: Option<&str>) -> Result<(Device, String), String> {
+    let (base_query, endpoint_spec) = if let Some((base, ep)) = id_or_name.rsplit_once(':') {
+        if ep == "lan" || ep == "tailcat" {
+            (base, Some(ep))
+        } else {
+            (id_or_name, None)
+        }
+    } else {
+        (id_or_name, None)
+    };
+    let desired_ep = endpoint_override.or(endpoint_spec);
+
     let path = registry_path()?;
     let _lock = lock_registry(&path, true)?;
     let mut registry = load_registry(&path)?;
 
     let target_id = {
-        let exact_id = registry.devices.iter().find(|d| d.id == id_or_name);
+        let exact_id = registry.devices.iter().find(|d| d.id == base_query);
         if let Some(d) = exact_id {
             d.id.clone()
         } else {
             let matches: Vec<_> = registry
                 .devices
                 .iter()
-                .filter(|d| d.name.eq_ignore_ascii_case(id_or_name))
+                .filter(|d| d.name.eq_ignore_ascii_case(base_query))
                 .collect();
             if matches.len() == 1 {
                 matches[0].id.clone()
             } else if matches.len() > 1 {
-                return Err(format!("device name {:?} is ambiguous", id_or_name));
+                return Err(format!("device name {:?} is ambiguous", base_query));
             } else {
-                return Err(format!("device {:?} not found", id_or_name));
+                return Err(format!("device {:?} not found", base_query));
             }
         }
     };
@@ -573,14 +595,32 @@ pub fn select(id_or_name: &str) -> Result<Device, String> {
         .unwrap();
 
     registry.active_device_id = target_id;
-    if registry.active_endpoint == "lan" && device.lan.is_none() {
-        registry.active_endpoint = "tailcat".to_owned();
-    } else if registry.active_endpoint == "tailcat" && device.tailcat.is_none() {
-        registry.active_endpoint = "lan".to_owned();
+    if let Some(ep) = desired_ep {
+        match ep {
+            "lan" => {
+                if device.lan.is_none() {
+                    return Err(format!("device {:?} has no LAN endpoint configured", device.name));
+                }
+                registry.active_endpoint = "lan".to_owned();
+            }
+            "tailcat" => {
+                if device.tailcat.is_none() {
+                    return Err(format!("device {:?} has no Tailcat endpoint configured", device.name));
+                }
+                registry.active_endpoint = "tailcat".to_owned();
+            }
+            other => return Err(format!("unknown endpoint type {:?}", other)),
+        }
+    } else {
+        if registry.active_endpoint == "lan" && device.lan.is_none() {
+            registry.active_endpoint = "tailcat".to_owned();
+        } else if registry.active_endpoint == "tailcat" && device.tailcat.is_none() {
+            registry.active_endpoint = "lan".to_owned();
+        }
     }
 
     commit(&path, &mut registry)?;
-    Ok(device)
+    Ok((device, registry.active_endpoint.clone()))
 }
 
 pub fn upsert_device(device: Device) -> Result<Device, String> {
@@ -818,10 +858,7 @@ pub fn record_setup(
 }
 
 // Frontend export/sync for UI adapters (Calibre plugin, etc.)
-pub fn frontend() -> Result<Value, String> {
-    let path = registry_path()?;
-    let _lock = lock_registry(&path, false)?;
-    let registry = load_registry(&path)?;
+fn frontend_from_registry(registry: &Registry) -> Value {
     let mut rows = Vec::new();
 
     for device in &registry.devices {
@@ -842,11 +879,18 @@ pub fn frontend() -> Result<Value, String> {
         ))
     };
 
-    Ok(json!({
+    json!({
         "revision": registry.revision,
         "active_id": active_id,
         "devices": rows,
-    }))
+    })
+}
+
+pub fn frontend() -> Result<Value, String> {
+    let path = registry_path()?;
+    let _lock = lock_registry(&path, false)?;
+    let registry = load_registry(&path)?;
+    Ok(frontend_from_registry(&registry))
 }
 
 fn frontend_row(device: &Device, endpoint: &str, config: &Config) -> Value {
@@ -922,10 +966,17 @@ pub fn sync_frontend(value: Value) -> Result<Value, String> {
             .as_object()
             .ok_or_else(|| "device row must be an object".to_owned())?;
 
-        let endpoint = row_obj
-            .get("endpoint")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "missing endpoint".to_owned())?;
+        let endpoint = if let Some(ep) = row_obj.get("endpoint").and_then(Value::as_str) {
+            ep.to_owned()
+        } else if let Some(host) = row_obj.get("host").and_then(Value::as_str) {
+            if crate::is_tailcat_host(host) {
+                "tailcat".to_owned()
+            } else {
+                "lan".to_owned()
+            }
+        } else {
+            "lan".to_owned()
+        };
         if endpoint != "lan" && endpoint != "tailcat" {
             return Err(format!("invalid endpoint {:?}", endpoint));
         }
@@ -1052,7 +1103,7 @@ pub fn sync_frontend(value: Value) -> Result<Value, String> {
     }
 
     commit(&path, &mut registry)?;
-    frontend()
+    Ok(frontend_from_registry(&registry))
 }
 
 #[cfg(test)]
@@ -1062,6 +1113,7 @@ mod tests {
     #[test]
     fn aliases_strip_only_terminal_tailcat_suffix() {
         assert_eq!(normalized_alias("Reader (Tailcat)"), "Reader");
+        assert_eq!(normalized_alias("Reader (Tailscale)"), "Reader");
         assert_eq!(
             normalized_alias("Reader (Tailcat) extra"),
             "Reader (Tailcat) extra"
