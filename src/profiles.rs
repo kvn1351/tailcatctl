@@ -743,7 +743,20 @@ pub fn remove_device(id_or_name: &str) -> Result<Device, String> {
     let index = registry
         .devices
         .iter()
-        .position(|d| d.id == id_or_name || d.name.eq_ignore_ascii_case(id_or_name))
+        .position(|d| {
+            d.id == id_or_name
+                || d.name.eq_ignore_ascii_case(id_or_name)
+                || d.lan.as_ref().map_or(false, |l| {
+                    l.host == id_or_name
+                        || format!("{}:{}", l.host, l.port) == id_or_name
+                        || (id_or_name.len() >= 8 && l.host.starts_with(id_or_name))
+                })
+                || d.tailcat.as_ref().map_or(false, |t| {
+                    t.host == id_or_name
+                        || format!("{}:{}", t.host, t.port) == id_or_name
+                        || (id_or_name.len() >= 8 && t.host.starts_with(id_or_name))
+                })
+        })
         .ok_or_else(|| format!("device {:?} not found", id_or_name))?;
 
     let removed = registry.devices.remove(index);
@@ -966,16 +979,14 @@ pub fn sync_frontend(value: Value) -> Result<Value, String> {
             .as_object()
             .ok_or_else(|| "device row must be an object".to_owned())?;
 
-        let endpoint = if let Some(ep) = row_obj.get("endpoint").and_then(Value::as_str) {
-            ep.to_owned()
-        } else if let Some(host) = row_obj.get("host").and_then(Value::as_str) {
+        let endpoint = if let Some(host) = row_obj.get("host").and_then(Value::as_str) {
             if crate::is_tailcat_host(host) {
                 "tailcat".to_owned()
             } else {
-                "lan".to_owned()
+                row_obj.get("endpoint").and_then(Value::as_str).unwrap_or("lan").to_owned()
             }
         } else {
-            "lan".to_owned()
+            row_obj.get("endpoint").and_then(Value::as_str).unwrap_or("lan").to_owned()
         };
         if endpoint != "lan" && endpoint != "tailcat" {
             return Err(format!("invalid endpoint {:?}", endpoint));
@@ -1256,7 +1267,7 @@ mod registry_tests {
             None,
         )
         .unwrap();
-        assert!(select("Reader").is_err());
+        assert!(select("Reader", None).is_err());
     }
 
     #[test]

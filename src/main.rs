@@ -38,6 +38,16 @@ fn install_signal_handlers() {
     }
 }
 
+fn shorten_middle(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len || max_len < 7 {
+        return s.to_string();
+    }
+    let keep = max_len - 3;
+    let head = (keep + 1) / 2;
+    let tail = keep / 2;
+    format!("{}...{}", &s[..head], &s[s.len() - tail..])
+}
+
 fn usage() {
     println!(
         "tailcatctl: Tailcat connection manager and SSH tool\n\n\
@@ -534,11 +544,7 @@ fn status_command(args: &[String]) -> Result<i32, String> {
             };
 
             if !active_only || active_conn.is_some() {
-                let addr_trunc = if tc.host.len() > 30 {
-                    format!("{}...", &tc.host[..27])
-                } else {
-                    tc.host.clone()
-                };
+                let addr_trunc = shorten_middle(&tc.host, 30);
                 println!(
                     "{:<32} {:<16} {:<10} {:<10} {}",
                     addr_trunc, dev_display, tc.username, "tailcat", status_str
@@ -701,10 +707,11 @@ fn devices_command(args: &[String]) -> Result<i32, String> {
     println!("{:<16} {:<24} {:<10} {:<32}", "----", "--", "----", "----");
     for dev in &reg.devices {
         if let Some(tc) = &dev.tailcat {
-            println!("{:<16} {:<24} {:<10} {:<32}", dev.name, dev.id, "tailcat", tc.host);
+            println!("{:<16} {:<24} {:<10} {:<32}", dev.name, dev.id, "tailcat", shorten_middle(&tc.host, 32));
         }
         if let Some(lan) = &dev.lan {
-            println!("{:<16} {:<24} {:<10} {:<32}", dev.name, dev.id, "lan", format!("{}:{}", lan.host, lan.port));
+            let host_str = format!("{}:{}", lan.host, lan.port);
+            println!("{:<16} {:<24} {:<10} {:<32}", dev.name, dev.id, "lan", shorten_middle(&host_str, 32));
         }
     }
     Ok(0)
